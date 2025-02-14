@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+import numpy as np
+import pickle
+import torch
+from transformers import AutoTokenizer, AutoModel
+import faiss
+
+# ---------------- Configuration ----------------
+EMBEDDINGS_FILE = 'bert_embeddings.npy'
+META_FILE = 'bert_metadata.pkl'
+SIMILARITY_THRESHOLD = 0.7  # Cosine similarity threshold (0 to 1 scale)
+embedding_dim = 768  # for bert-base-uncased
+
+# Load the BERT model and tokenizer (needed to embed the query).
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased")
+
+def load_embeddings_and_metadata():
+    embeddings = np.load(EMBEDDINGS_FILE)
+    with open(META_FILE, 'rb') as f:
+        metadata = pickle.load(f)
+    return embeddings, metadata
+
+def build_faiss_index(embeddings):
+    # Normalize embeddings for cosine similarity.
+    faiss.normalize_L2(embeddings)
+    # Create a FAISS HNSW index.
+    index = faiss.IndexHNSWFlat(embedding_dim, 32, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = 40
+    index.add(embeddings)
+    return index
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+    return sum_embeddings / sum_mask
+
+def query_system():
+    embeddings, metadata = load_embeddings_and_metadata()
+    index = build_faiss_index(embeddings)
+    
+    print("\nEnter new test case details (input can be incomplete):")
+    new_user_story = input("New User Story: ").strip()
+    new_acceptance_criteria = input("New Acceptance Criteria: ").strip()
+    new_input_combined = f"User Story: {new_user_story} Acceptance Criteria: {new_acceptance_criteria}"
+    
+    # Compute BERT embedding for the new input.
+    encoded_input = tokenizer(new_input_combined, padding=True, truncation=True, return_tensors='pt')
+    with torch.no_grad():
+        model_output = model(**encoded_input)
+    sentence_embedding = mean_pooling(model_output, encoded_input['attention_mask'])
+    query_embedding = sentence_embedding[0].numpy().astype('float32')
+    
+    # Expand dims and normalize the query embedding.
+    query_embedding = np.expand_dims(query_embedding, axis=0)
+    faiss.normalize_L2(query_embedding)
+    
+    # Search the FAISS index.
+    distances, indices = index.search(query_embedding, 3)
+    
+    print("\nMatching stored test cases using BERT + FAISS (HNSW):\n")
+    matches_found = False
+    for score, idx in zip(distances[0], indices[0]):
+        if score >= SIMILARITY_THRESHOLD:
+            matches_found = True
+            rec = metadata[idx]
+            print(f"Match Found (Similarity Score: {score:.4f})")
+            print(f"ID: {rec['id']}")
+            print(f"User Story: {rec['user_story']}")
+            print(f"Acceptance Criteria: {rec['acceptance_criteria']}\n")
+    if not matches_found:
+        print("No matches found above the similarity threshold.")
+
+if __name__ == "__main__":
+    query_system()
