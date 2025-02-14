@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+import mysql.connector
+from mysql.connector import Error
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+
+# ---------------- MySQL Configuration ----------------
+MYSQL_CONFIG = {
+    'host': 'localhost',
+    'user': 'your_mysql_user',
+    'password': 'your_mysql_password',
+    'database': 'your_database_name'
+}
+
+TABLE_NAME = 'test_cases'
+
+# Similarity threshold for cosine similarity (0 to 1 scale)
+SIMILARITY_THRESHOLD = 0.7
+
+# ---------------- Embedding Model Initialization ----------------
+# We'll use all-MiniLM-L6-v2 to generate semantic embeddings.
+model = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_dim = 384  # Dimension for all-MiniLM-L6-v2 embeddings
+
+def create_connection():
+    """Create and return a MySQL database connection."""
+    try:
+        connection = mysql.connector.connect(**MYSQL_CONFIG)
+        if connection.is_connected():
+            return connection
+    except Error as e:
+        print("Error while connecting to MySQL:", e)
+    return None
+
+def create_table():
+    """Create the test_cases table if it doesn't exist."""
+    create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_story TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL
+        );
+    """
+    connection = create_connection()
+    if connection:
+        try:
+            cursor = connection.cursor()
+            cursor.execute(create_table_query)
+            connection.commit()
+            print(f"Table '{TABLE_NAME}' ensured in database.")
+        except Error as e:
+            print("Error creating table:", e)
+        finally:
+            cursor.close()
+            connection.close()
+
+def insert_dummy_data():
+    """Insert dummy test case data if the table is empty."""
+    dummy_data = [
+        ("User can log in with valid credentials", "Login should succeed when the username and password are correct."),
+        ("User can reset password", "User should receive an email with instructions to reset the password."),
+        ("User profile is editable", "User can update personal information and save changes.")
+    ]
+    
+    connection = create_connection()
+    if connection:
+        try:
+            cursor = connection.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}")
+            count = cursor.fetchone()[0]
+            if count == 0:
+                insert_query = f"INSERT INTO {TABLE_NAME} (user_story, acceptance_criteria) VALUES (%s, %s)"
+                cursor.executemany(insert_query, dummy_data)
+                connection.commit()
+                print("Inserted dummy data into the table.")
+            else:
+                print("Table already has data; skipping dummy data insertion.")
+        except Error as e:
+            print("Error inserting dummy data:", e)
+        finally:
+            cursor.close()
+            connection.close()
+
+def fetch_test_cases():
+    """Fetch all test cases from the database."""
+    connection = create_connection()
+    records = []
+    if connection:
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(f"SELECT id, user_story, acceptance_criteria FROM {TABLE_NAME}")
+            records = cursor.fetchall()
+            print(f"Fetched {len(records)} test cases from the database.")
+        except Error as e:
+            print("Error fetching data:", e)
+        finally:
+            cursor.close()
+            connection.close()
+    return records
+
+def combine_text(record):
+    """Combine user_story and acceptance_criteria from a record."""
+    return f"User Story: {record['user_story']} Acceptance Criteria: {record['acceptance_criteria']}"
+
+def build_faiss_index(test_cases):
+    """
+    Build a FAISS HNSW index for the test_cases using embeddings from all-MiniLM-L6-v2.
+    Returns the index, a list of record IDs, and the computed embeddings.
+    """
+    embeddings = []
+    ids = []
+    for tc in test_cases:
+        combined = combine_text(tc)
+        emb = model.encode(combined)
+        embeddings.append(emb)
+        ids.append(tc['id'])
+    
+    embeddings = np.array(embeddings).astype('float32')
+    
+    # Normalize embeddings for cosine similarity.
+    faiss.normalize_L2(embeddings)
+    
+    # Create a FAISS index using HNSW.
+    # Here, M is the number of neighbors in the HNSW graph (e.g., 32), and we use inner product metric.
+    index = faiss.IndexHNSWFlat(embedding_dim, 32, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = 40  # Parameter controlling index construction quality
+    index.add(embeddings)
+    
+    return index, ids, embeddings
+
+def search_faiss(index, query_embedding, k=3):
+    """
+    Search FAISS index for similar test cases.
+    Returns distances (similarity scores) and indices.
+    """
+    query_embedding = np.array([query_embedding]).astype('float32')
+    faiss.normalize_L2(query_embedding)
+    distances, indices = index.search(query_embedding, k)
+    return distances[0], indices[0]
+
+def main():
+    # Step 1: Setup database table and insert dummy data.
+    create_table()
+    insert_dummy_data()
+    
+    # Step 2: Fetch stored test cases.
+    test_cases = fetch_test_cases()
+    if not test_cases:
+        print("No test cases found. Exiting.")
+        return
+    
+    # Build FAISS index from test case embeddings.
+    index, ids, _ = build_faiss_index(test_cases)
+    
+    # Step 3: Get new user input.
+    print("\nEnter new test case details (input can be incomplete):")
+    new_user_story = input("New User Story: ").strip()
+    new_acceptance_criteria = input("New Acceptance Criteria: ").strip()
+    
+    # Combine new inputs into one string.
+    new_input_combined = f"User Story: {new_user_story} Acceptance Criteria: {new_acceptance_criteria}"
+    
+    # Compute embedding for the new input.
+    query_embedding = model.encode(new_input_combined)
+    
+    # Search in the FAISS index.
+    distances, indices = search_faiss(index, query_embedding, k=3)
+    
+    print("\nMatching stored test cases using all-MiniLM-L6-v2 + FAISS (HNSW):\n")
+    matches_found = False
+    for score, idx in zip(distances, indices):
+        # 'score' is cosine similarity since embeddings are normalized.
+        if score >= SIMILARITY_THRESHOLD:
+            matches_found = True
+            record_id = ids[idx]
+            # Lookup the matching test case from test_cases.
+            tc = next((x for x in test_cases if x['id'] == record_id), None)
+            if tc:
+                print(f"Match Found (Similarity Score: {score:.4f})")
+                print(f"ID: {tc['id']}")
+                print(f"User Story: {tc['user_story']}")
+                print(f"Acceptance Criteria: {tc['acceptance_criteria']}\n")
+    
+    if not matches_found:
+        print("No matches found above the similarity threshold.")
+
+if __name__ == "__main__":
+    main()
