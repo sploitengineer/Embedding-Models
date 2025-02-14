@@ -1,0 +1,26 @@
+Storing the embeddings and metadata separately is a design choice that offers flexibility and granularity for retrieval. Here’s why we do it that way:
+
+Per-Record Granularity:
+
+Individual Embeddings:
+Each record (test case) gets its own embedding, which allows you to compare the new query against each record individually. This is essential for ranking and retrieving the best matches.
+Metadata Storage:
+Storing the corresponding metadata (such as ID, user_story, and acceptance_criteria) separately means that once you find a matching embedding, you can easily look up all the detailed information associated with that record.
+Efficient Similarity Search:
+
+FAISS Indexing:
+FAISS is built to index many high-dimensional vectors. By saving each record’s embedding as an individual vector in a NumPy array, you can efficiently build and query the index.
+Flexibility:
+If you combined all table data into one single embedding, you’d lose the ability to retrieve and rank individual records. You need a one-to-one mapping between a record and its vector for a meaningful similarity search.
+Modularity and Updates:
+
+Incremental Updates:
+When new records are added or existing ones are updated, you can compute embeddings only for the changed records and update your metadata accordingly.
+Separation of Concerns:
+The embeddings (numerical representations) are used solely for similarity computation, while the metadata holds the human-readable data. This separation makes the system easier to manage and debug.
+In summary, saving embeddings as a NumPy array (with each vector representing one record) along with separate metadata lets you:
+
+Quickly search for similar items,
+Retrieve detailed record information, and
+Update your system efficiently as the dataset changes.
+This approach is crucial for building an effective and scalable retrieval system in a RAG model.
