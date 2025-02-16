@@ -1,0 +1,5 @@
+Note on Requirements:
+• For USE Lite, you’ll need to install TensorFlow, TensorFlow Hub, and TensorFlow Text (e.g. via pip install tensorflow tensorflow-hub tensorflow-text).
+• For Doc2Vec, you’ll need Gensim and NLTK (e.g. via pip install gensim nltk).
+• FAISS (e.g. via pip install faiss-cpu).
+
