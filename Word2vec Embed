@@ -1,0 +1,188 @@
+#!/usr/bin/env python
+import mysql.connector
+from mysql.connector import Error
+import pickle
+import numpy as np
+from gensim.models import Word2Vec
+import nltk
+nltk.download('punkt')
+from nltk.tokenize import word_tokenize
+
+# ---------------- MySQL Configuration ----------------
+MYSQL_CONFIG = {
+    'host': 'localhost',
+    'user': 'your_mysql_user',
+    'password': 'your_mysql_password',
+    'database': 'your_database_name'
+}
+
+TABLE_NAME = 'test_cases'
+EMBEDDINGS_FILE = 'word2vec_embeddings.npy'
+META_FILE = 'word2vec_metadata.pkl'
+MODEL_FILE = 'word2vec.model'
+
+def create_connection():
+    """Create and return a MySQL database connection."""
+    try:
+        connection = mysql.connector.connect(**MYSQL_CONFIG)
+        if connection.is_connected():
+            return connection
+    except Error as e:
+        print("Error connecting to MySQL:", e)
+    return None
+
+def fetch_test_cases():
+    """Fetch all test cases from the database."""
+    connection = create_connection()
+    records = []
+    if connection:
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(f"SELECT id, user_story, acceptance_criteria FROM {TABLE_NAME}")
+            records = cursor.fetchall()
+            print(f"Fetched {len(records)} test cases from the database.")
+        except Error as e:
+            print("Error fetching data:", e)
+        finally:
+            cursor.close()
+            connection.close()
+    return records
+
+def combine_text(record):
+    """Combine user_story and acceptance_criteria from a record."""
+    return f"User Story: {record['user_story']} Acceptance Criteria: {record['acceptance_criteria']}"
+
+def tokenize(text):
+    """Tokenize the text using NLTK (lowercasing included)."""
+    return word_tokenize(text.lower())
+
+def compute_average_vector(tokens, model, vector_size):
+    """Compute the average word vector for the list of tokens."""
+    # Filter tokens that are in the model vocabulary.
+    valid_tokens = [token for token in tokens if token in model.wv]
+    if not valid_tokens:
+        return np.zeros(vector_size)
+    vectors = [model.wv[token] for token in valid_tokens]
+    return np.mean(vectors, axis=0)
+
+def compute_and_save_word2vec_embeddings():
+    test_cases = fetch_test_cases()
+    if not test_cases:
+        print("No test cases found. Exiting.")
+        return
+    
+    corpus = []  # List of token lists for training Word2Vec.
+    metadata = []  # List to store metadata for each record.
+    
+    for tc in test_cases:
+        combined = combine_text(tc)
+        tokens = tokenize(combined)
+        corpus.append(tokens)
+        metadata.append({
+            'id': tc['id'],
+            'combined': combined,
+            'user_story': tc['user_story'],
+            'acceptance_criteria': tc['acceptance_criteria']
+        })
+    
+    # Train Word2Vec model on the corpus.
+    vector_size = 100  # Adjust dimension as needed.
+    w2v_model = Word2Vec(sentences=corpus, vector_size=vector_size, window=5, min_count=1, workers=4, epochs=40)
+    w2v_model.save(MODEL_FILE)
+    
+    # Compute average vector for each document.
+    embeddings = []
+    for tokens in corpus:
+        avg_vec = compute_average_vector(tokens, w2v_model, vector_size)
+        embeddings.append(avg_vec)
+    
+    embeddings = np.array(embeddings).astype('float32')
+    np.save(EMBEDDINGS_FILE, embeddings)
+    with open(META_FILE, 'wb') as f:
+        pickle.dump(metadata, f)
+    
+    print(f"Saved {len(embeddings)} Word2Vec embeddings to {EMBEDDINGS_FILE}, metadata to {META_FILE}, and model to {MODEL_FILE}.")
+
+if __name__ == "__main__":
+    compute_and_save_word2vec_embeddings()
+
+
+
+
+
+
+
+
+#!/usr/bin/env python
+import numpy as np
+import pickle
+from gensim.models import Word2Vec
+import faiss
+import nltk
+nltk.download('punkt')
+from nltk.tokenize import word_tokenize
+
+EMBEDDINGS_FILE = 'word2vec_embeddings.npy'
+META_FILE = 'word2vec_metadata.pkl'
+MODEL_FILE = 'word2vec.model'
+SIMILARITY_THRESHOLD = 0.7  # Cosine similarity threshold (0 to 1 scale)
+embedding_dim = 100  # Must match vector_size used in training
+
+def load_word2vec_embeddings_and_metadata():
+    embeddings = np.load(EMBEDDINGS_FILE)
+    with open(META_FILE, 'rb') as f:
+        metadata = pickle.load(f)
+    return embeddings, metadata
+
+def load_word2vec_model():
+    model = Word2Vec.load(MODEL_FILE)
+    return model
+
+def build_faiss_index(embeddings, dimension):
+    # Normalize embeddings so that inner product equals cosine similarity.
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = 40
+    index.add(embeddings)
+    return index
+
+def compute_average_vector(tokens, model, vector_size):
+    valid_tokens = [token for token in tokens if token in model.wv]
+    if not valid_tokens:
+        return np.zeros(vector_size)
+    vectors = [model.wv[token] for token in valid_tokens]
+    return np.mean(vectors, axis=0)
+
+def query_system():
+    embeddings, metadata = load_word2vec_embeddings_and_metadata()
+    index = build_faiss_index(embeddings, embedding_dim)
+    model = load_word2vec_model()
+    
+    print("\nEnter new test case details (input can be incomplete):")
+    new_user_story = input("New User Story: ").strip()
+    new_acceptance_criteria = input("New Acceptance Criteria: ").strip()
+    new_input_combined = f"User Story: {new_user_story} Acceptance Criteria: {new_acceptance_criteria}"
+    
+    tokens = word_tokenize(new_input_combined.lower())
+    query_vec = compute_average_vector(tokens, model, embedding_dim).astype('float32')
+    query_vec = query_vec.reshape(1, -1)
+    faiss.normalize_L2(query_vec)
+    
+    distances, indices = index.search(query_vec, k=3)
+    
+    print("\nMatching stored test cases using Word2Vec + FAISS (HNSW):\n")
+    matches_found = False
+    for score, idx in zip(distances[0], indices[0]):
+        if score >= SIMILARITY_THRESHOLD:
+            matches_found = True
+            rec = metadata[idx]
+            print(f"Match Found (Similarity Score: {score:.4f})")
+            print(f"ID: {rec['id']}")
+            print(f"User Story: {rec['user_story']}")
+            print(f"Acceptance Criteria: {rec['acceptance_criteria']}\n")
+    
+    if not matches_found:
+        print("No matches found above the similarity threshold.")
+
+if __name__ == "__main__":
+    query_system()
