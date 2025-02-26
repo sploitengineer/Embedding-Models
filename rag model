@@ -1,0 +1,310 @@
+#!/usr/bin/env python
+
+import os
+import time
+import mysql.connector
+from mysql.connector import Error
+from fuzzywuzzy import fuzz
+import numpy as np
+import faiss
+import requests
+import json
+
+# Sumy for summarization
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lex_rank import LexRankSummarizer
+
+# LangChain imports
+from langchain.agents import Tool, initialize_agent
+from langchain.agents import AgentType
+from langchain.llms import OpenAI
+from langchain.utilities import PythonREPL
+
+
+# --------------------- CONFIG ---------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")  # Replace if needed
+MYSQL_CONFIG = {
+    'host': 'localhost',
+    'user': 'your_mysql_user',
+    'password': 'your_mysql_password',
+    'database': 'dashboard_db'
+}
+TABLE_NAME = 'test_cases'
+DEDUP_THRESHOLD = 85
+EMBEDDING_MODEL = "text-embedding-ada-002"
+FAISS_SIMILARITY_THRESHOLD = 0.7
+TOP_K = 3
+
+# For final prompt expansion
+COMPLETION_MODEL = "text-davinci-003"
+
+
+# ------------------ DEDUPLICATION ------------------
+def create_connection():
+    try:
+        connection = mysql.connector.connect(**MYSQL_CONFIG)
+        if connection.is_connected():
+            return connection
+    except Error as e:
+        print("Error while connecting to MySQL:", e)
+    return None
+
+def fetch_test_cases():
+    """Fetch all test cases from MySQL."""
+    conn = create_connection()
+    records = []
+    if conn:
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(f"SELECT id, user_story, acceptance_criteria FROM {TABLE_NAME}")
+            records = cursor.fetchall()
+        except Error as e:
+            print("Error fetching data:", e)
+        finally:
+            cursor.close()
+            conn.close()
+    return records
+
+def combine_record(record):
+    return f"User Story: {record['user_story']} Acceptance Criteria: {record['acceptance_criteria']}"
+
+def deduplicate_records(records, threshold=DEDUP_THRESHOLD):
+    """Deduplicate records using FuzzyWuzzy token_set_ratio."""
+    records_with_text = [
+        {**r, "combined": combine_record(r)} for r in records
+    ]
+    # Sort descending by combined text length
+    records_sorted = sorted(records_with_text, key=lambda r: len(r["combined"]), reverse=True)
+    
+    deduplicated = []
+    for rec in records_sorted:
+        is_duplicate = False
+        for rep in deduplicated:
+            score = fuzz.token_set_ratio(rec["combined"], rep["combined"])
+            if score >= threshold:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            deduplicated.append(rec)
+    return deduplicated
+
+
+# ------------------ EMBEDDING + FAISS --------------
+def call_openai_embedding_api(text):
+    """
+    Call OpenAI's embedding endpoint for text-embedding-ada-002.
+    Returns a NumPy float32 vector or None if error.
+    """
+    url = "https://api.openai.com/v1/embeddings"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+    data = {"model": EMBEDDING_MODEL, "input": text}
+    resp = requests.post(url, headers=headers, json=data)
+    if resp.status_code == 200:
+        embedding = resp.json()["data"][0]["embedding"]
+        return np.array(embedding, dtype=np.float32)
+    else:
+        print("OpenAI embedding request failed:", resp.status_code, resp.text)
+        return None
+
+def build_faiss_index(records):
+    """
+    Deduplicated records -> embeddings -> FAISS index.
+    Returns (faiss_index, metadata_list).
+    """
+    embeddings = []
+    metadata = []
+    for r in records:
+        emb = call_openai_embedding_api(r["combined"])
+        if emb is not None:
+            embeddings.append(emb)
+            metadata.append(r)
+            # Sleep to avoid rate limiting (adjust as needed).
+            time.sleep(0.5)
+    embeddings = np.array(embeddings, dtype=np.float32)
+    if len(embeddings) == 0:
+        return None, []
+    
+    # Normalize for cosine similarity
+    faiss.normalize_L2(embeddings)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = 40
+    index.add(embeddings)
+    return index, metadata
+
+def search_similar(index, metadata, query_text, top_k=TOP_K):
+    """Embed query_text, search FAISS, return top matches above threshold."""
+    emb = call_openai_embedding_api(query_text)
+    if emb is None:
+        return []
+    faiss.normalize_L2(emb.reshape(1, -1))
+    distances, indices = index.search(emb.reshape(1, -1), top_k)
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if dist >= FAISS_SIMILARITY_THRESHOLD:
+            results.append((dist, metadata[idx]))
+    return results
+
+
+# ------------------ SUMMARIZATION -------------------
+def sumy_summarize(text, sentences_count=3):
+    """
+    Summarize the given text using the LexRank algorithm from Sumy.
+    """
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LexRankSummarizer()
+    summary = summarizer(parser.document, sentences_count)
+    summarized_text = " ".join(str(sentence) for sentence in summary)
+    return summarized_text
+
+
+# ------------------ FINAL EXPANSION -----------------
+def expand_user_query(user_query, context):
+    """
+    Use an OpenAI completion model to expand the user's incomplete query
+    with the summarized or single similar context.
+    """
+    import openai
+    openai.api_key = OPENAI_API_KEY
+    
+    prompt = (
+        f"You have an incomplete user story and acceptance criteria:\n{user_query}\n\n"
+        f"Relevant context from previous queries:\n{context}\n\n"
+        f"Please expand and refine the user story and acceptance criteria into a more detailed version."
+    )
+    resp = openai.Completion.create(
+        model=COMPLETION_MODEL,
+        prompt=prompt,
+        max_tokens=150,
+        temperature=0.5
+    )
+    return resp.choices[0].text.strip()
+
+
+# ------------------ LANGCHAIN AGENT -----------------
+"""
+We'll define three Tools in LangChain:
+1. deduplicate_tool
+2. build_faiss_tool
+3. summarize_tool
+
+Then a final 'run' sequence that orchestrates them.
+For a fully dynamic agent that decides on its own, you'd let the LLM reason about which tool to call.
+Below is a simpler demonstration that just calls them in order.
+"""
+
+from langchain.agents import Tool
+from langchain.llms import OpenAI
+
+# 1) Tool: Deduplicate from MySQL
+def deduplicate_tool_func(_input=""):
+    # _input is not used here, but needed for Tool signature
+    raw_records = fetch_test_cases()
+    if not raw_records:
+        return "No records found in MySQL."
+    deduped = deduplicate_records(raw_records)
+    return deduped  # We'll pass this as the "return" from the tool
+
+deduplicate_tool = Tool(
+    name="deduplicate_tool",
+    func=deduplicate_tool_func,
+    description="Deduplicate data from MySQL using fuzzy matching."
+)
+
+# 2) Tool: Build FAISS from deduplicated data
+#    We assume the 'input' is the deduplicated data from the previous tool
+def build_faiss_tool_func(deduped_data):
+    if not isinstance(deduped_data, list):
+        return "Error: expected a list of records from the deduplicate_tool."
+    index, metadata = build_faiss_index(deduped_data)
+    if index is None:
+        return "Error: No embeddings built."
+    return {
+        "faiss_index": index,
+        "metadata": metadata
+    }
+
+build_faiss_tool = Tool(
+    name="build_faiss_tool",
+    func=build_faiss_tool_func,
+    description="Build a FAISS index from deduplicated records."
+)
+
+# 3) Tool: Summarize multiple texts
+def summarize_tool_func(text_list):
+    if not isinstance(text_list, list):
+        return "Error: expected a list of text strings to summarize."
+    combined = " ".join(text_list)
+    summary = sumy_summarize(combined, sentences_count=3)
+    return summary
+
+summarize_tool = Tool(
+    name="summarize_tool",
+    func=summarize_tool_func,
+    description="Summarize multiple similar records using LexRank."
+)
+
+# 4) We'll define a final function that orchestrates the entire flow:
+def rag_pipeline():
+    """
+    A simple function that:
+    1. Calls deduplicate_tool
+    2. Calls build_faiss_tool
+    3. Asks user for a new query
+    4. Searches FAISS
+    5. Summarizes if multiple matches
+    6. Calls expand_user_query
+    """
+    print("Step 1: Deduplicate MySQL data.")
+    deduped = deduplicate_tool_func()
+    if isinstance(deduped, str):
+        print(deduped)
+        return
+    
+    print(f"Deduplicated to {len(deduped)} records.")
+    
+    print("Step 2: Build FAISS index.")
+    faiss_result = build_faiss_tool_func(deduped)
+    if isinstance(faiss_result, str):
+        print(faiss_result)
+        return
+    faiss_index = faiss_result["faiss_index"]
+    metadata = faiss_result["metadata"]
+    
+    # Step 3: Ask user for a new query
+    print("\nEnter new test case details (input can be incomplete):")
+    new_user_story = input("New User Story: ").strip()
+    new_acceptance_criteria = input("New Acceptance Criteria: ").strip()
+    new_query = f"User Story: {new_user_story} Acceptance Criteria: {new_acceptance_criteria}"
+    
+    # Step 4: Search FAISS
+    results = search_similar(faiss_index, metadata, new_query, top_k=TOP_K)
+    if not results:
+        print("No similar records found above threshold.")
+        # Possibly just expand with no context
+        final_output = expand_user_query(new_query, "")
+        print("\n--- Refined Output ---\n", final_output)
+        return
+    
+    # results is a list of (distance, record)
+    # Step 5: Summarize if multiple
+    if len(results) > 1:
+        similar_texts = [r["combined"] for (_, r) in results]
+        summary = summarize_tool_func(similar_texts)
+    else:
+        summary = results[0][1]["combined"]
+    
+    # Step 6: Expand user query
+    final_output = expand_user_query(new_query, summary)
+    
+    print("\n--- Refined Output ---\n", final_output)
+
+# Finally, we can define a main
+if __name__ == "__main__":
+    # Optional: you can use a real LangChain Agent if you want the LLM to decide which tool to call.
+    # For now, we do a straightforward pipeline.
+    rag_pipeline()
