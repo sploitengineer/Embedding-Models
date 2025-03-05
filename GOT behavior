@@ -1,0 +1,66 @@
+import requests
+import json
+import time
+
+# Replace with your API key (or set it in your environment)
+API_KEY = "YOUR_API_KEY_HERE"
+# Use your appropriate endpoint; this example uses a hypothetical endpoint.
+url = "https://mule4api-comm-amer-stg.pfizer.com/vessel-openai-api-v1/chatCompletion"
+
+# Generate a long repeated content that exceeds 1024 tokens.
+# (You can adjust the repetition count to ensure the token count is above 1024.)
+repeated_paragraph = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+    "Vestibulum consectetur, mauris sit amet gravida faucibus, "
+    "nisi erat efficitur leo, in commodo libero augue eget ligula. "
+    "Praesent sed turpis eu mauris accumsan condimentum. "
+    "Curabitur non consequat quam. "
+)
+# Repeat the paragraph many times to exceed 1024 tokens.
+long_content = repeated_paragraph * 150  # Adjust multiplier as needed
+
+# Build the messages array with a static prefix
+messages = [
+    {"role": "system", "content": "You are ChatGPT, a helpful assistant."},
+    {"role": "user", "content": f"Please analyze the following content in detail:\n\n{long_content}\n\nWhat insights can you provide?"}
+]
+
+payload = {
+    "engine": "gpt-4o-mini",   # Using the GPT-4o-mini model
+    "messages": messages,
+    "temperature": 0.5,
+    "max_tokens": 200
+}
+
+headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Authorization": f"Bearer {API_KEY}"
+}
+
+def call_api():
+    start = time.time()
+    resp = requests.post(url, headers=headers, data=json.dumps(payload))
+    elapsed = time.time() - start
+
+    if resp.status_code == 200:
+        resp_json = resp.json()
+        print("Time taken: {:.2f} seconds".format(elapsed))
+        print("Response JSON:")
+        print(json.dumps(resp_json, indent=2))
+        # Check the usage details for caching information
+        usage = resp_json.get("usage", {})
+        if "prompt_tokens_details" in usage:
+            print("Cached tokens:", usage["prompt_tokens_details"].get("cached_tokens", 0))
+        else:
+            print("Usage details:", usage)
+    else:
+        print("Error:", resp.status_code, resp.text)
+
+# First call (cache miss)
+print("=== First Call ===")
+call_api()
+
+# Second call with the same prompt (should be a cache hit)
+print("\n=== Second Call ===")
+call_api()
